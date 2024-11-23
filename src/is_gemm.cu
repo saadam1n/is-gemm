@@ -17,7 +17,7 @@ __device__ int binary_search(float* cmf, int cnt, float selected_cmf) {
     while(upper - lower > 1) {
         // minus one, we always want to try the smaller value first
         int mid = (lower + upper - 1) / 2;
-        if(selected_cmf > cmf[mid]) {
+        if(cmf[mid] > selected_cmf) {
             // this *could* be the selected cmf value, set upper to point to it (add one because it is non exclusive)
             upper = mid + 1;
         } else {
@@ -41,33 +41,28 @@ __global__ void is_gemm(
 
     for(int i = 0; i < num_accumulations; i++) {
         lcg_state = (LCG_MULT * lcg_state + LCG_ITER) % LCG_MAX;
-        float selected_input_cmf = (float)lcg_state / LCG_MAX;
 
-        int input_idx = binary_search(input_cmf, num_rows * feat_dim_in, selected_input_cmf);
-        int input_col = input_idx % feat_dim_in;
+        int input_idx = binary_search(input_cmf, num_rows * feat_dim_in, (float)lcg_state / LCG_MAX);
         int input_row = input_idx / feat_dim_in;
-        float input_pmf = input_cmf[input_idx] - (input_col != 0 ? input_cmf[input_idx - 1] : 0.0);
+        int input_col = input_idx % feat_dim_in;
+        float input_pmf = input_cmf[input_idx] - (input_idx != 0 ? input_cmf[input_idx - 1] : 0.0);
 
         // now that we have an input col, we need to search that row in the weight in particular
-        int weight_row = input_col;
 
         lcg_state = (LCG_MULT * lcg_state + LCG_ITER) % LCG_MAX;
-        float selected_weight_cmf = (float)lcg_state / LCG_MAX;
-        int weight_idx = binary_search(&weight_cmf[weight_row * feat_dim_out], feat_dim_out, selected_weight_cmf);
+        int weight_row = input_col; // column becomes row because of how matrix multiplication flips it
+        int weight_idx = binary_search(&weight_cmf[weight_row * feat_dim_out], feat_dim_out, (float)lcg_state / LCG_MAX);
         int weight_col = weight_idx; // no need to modulate
-        float weight_pmf = weight_cmf[weight_row * feat_dim_out + weight_col] - (weight_col != 0 ? weight_cmf[weight_row * feat_dim_out + weight_idx - 1] : 0.0);
+        float weight_pmf = weight_cmf[weight_row * feat_dim_out + weight_col] - (weight_col != 0 ? weight_cmf[weight_row * feat_dim_out + weight_col - 1] : 0.0);
 
-        // since weight is transposed itself, we need to swap them
-        int temp = weight_col;
-        weight_col = weight_row;
-        weight_row = temp;
 
-        float input_val = input[input_row * feat_dim_in + input_col];
-        float weight_val = weight[weight_row * feat_dim_in + weight_col];
+        float input_val = input[input_idx]; // we can reuse this variable from before
+        float weight_val = weight[weight_col * feat_dim_in + weight_row]; // need to flip because of how weight is represented
+
 
         // this actually should simplyfy down a lot
-        atomicAdd(&output[input_row * feat_dim_out + weight_row], input_val * weight_val / (input_pmf * weight_pmf));
-        atomicAdd(&sample_cnt[input_row * feat_dim_out + weight_row], 1);
+        atomicAdd(&output[input_row * feat_dim_out + weight_col], input_val * weight_val / (input_pmf * weight_pmf));
+        atomicAdd(&sample_cnt[input_row * feat_dim_out + weight_col], 1);
     }
 }
 
@@ -191,18 +186,18 @@ int main(int argc, char** argv) {
     
     std::cout << "Creating input pmf...\n";
     // no idea if cumsum breaks contiguity so lets do it just to be safe
-    torch::Tensor input_pmf = input.view(batch_size * seq_len * feat_dim_in).abs().cumsum(0).contiguous();
-    input_pmf /= input_pmf[batch_size * seq_len * feat_dim_in - 1].item<float>();
+    torch::Tensor input_cmf = input.view(batch_size * seq_len * feat_dim_in).abs().cumsum(0).contiguous();
+    input_cmf /= input_cmf[batch_size * seq_len * feat_dim_in - 1].item<float>();
 
 
     std::cout << "Creating weight pmf...\n";
     // if we pick a specific value in the input, then that value can only be multiplied by values within a particular row
     // so the weight matrix needs to be summed up on the row dimension
-    torch::Tensor weight_pmf = weight.abs().cumsum(0);
+    torch::Tensor weight_cmf = weight.abs().cumsum(0);
 
     // we need to divide each row by the sum (which is in the last row)
-    weight_pmf /= weight_pmf.narrow(0, feat_dim_out - 1, 1).expand({feat_dim_out, feat_dim_in});
-    weight_pmf = weight_pmf.transpose(0, 1).contiguous(); // make this easier for our code to read
+    weight_cmf /= weight_cmf.narrow(0, feat_dim_out - 1, 1).expand({feat_dim_out, feat_dim_in});
+    weight_cmf = weight_cmf.transpose(0, 1).contiguous(); // make this easier for our code to read
 
     std::cout << "Creating output and sample count matrices...\n";
     torch::Tensor output = torch::zeros({batch_size * seq_len, feat_dim_out}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0)).contiguous();
@@ -219,16 +214,16 @@ int main(int argc, char** argv) {
     std::cout << "Running importance sampling pass...\n";
     const int num_threads_is = 128;
     const int block_size_is = 128;
-    #if 0
-    is_gemm<<<num_threads_is, 1, 1>>>(
+    #if 1
+    is_gemm<<<num_threads_is / block_size_is, block_size_is>>>(
         batch_size * seq_len,
         feat_dim_in,
         feat_dim_out,
         num_accumulations,
         (float*)input.data_ptr(), 
-        (float*)input_pmf.data_ptr(), 
+        (float*)input_cmf.data_ptr(), 
         (float*)weight.data_ptr(), 
-        (float*)weight_pmf.data_ptr(), 
+        (float*)weight_cmf.data_ptr(), 
         (float*)output.data_ptr(),
         (unsigned int*) sample_cnt.data_ptr()
     );
@@ -272,6 +267,10 @@ int main(int argc, char** argv) {
     std::cout << sample_cnt << std::endl;
     std::cout << reference << std::endl;
     std::cout << stuff << std::endl;
+
+    std::cout << "CMFs" << std::endl;
+    std::cout << input_cmf << std::endl;
+    std::cout << weight_cmf << std::endl;
 
     return 0;
 }
