@@ -30,35 +30,78 @@ __device__ int binary_search(float* cmf, int cnt, float selected_cmf) {
     return lower;
 }
 
+
+__device__ unsigned int taus_step(unsigned int& z, unsigned int s1, unsigned int s2, unsigned int s3, unsigned int m) {
+    unsigned int b = (((z << s1) ^ z) >> s2);
+    z = (((z & m) << s3) ^ b);
+    return z;
+}
+
+__device__ unsigned int lcg_step(unsigned int& z, unsigned int a, unsigned int c) {
+    z = a * z + c;
+    return z;
+}
+
+__device__ unsigned int hybrid_taus_integer(uint4& state) {
+    return
+        taus_step(state.x, 13, 19, 12, 4294967294U) ^
+        taus_step(state.y, 2, 25, 4, 4294967288U) ^
+        taus_step(state.z, 3, 11, 17, 4294967280U) ^
+        lcg_step(state.w, 1664525, 1013904223U);
+}
+
+__device__ float hybrid_taus(uint4& state) {
+    return 2.3283064365387e-10 * float(
+        hybrid_taus_integer(state)
+    );
+}
+
+
 __global__ void is_gemm(
     int num_rows, int feat_dim_in, int feat_dim_out, int num_accumulations, 
-    float* input, float* input_cmf, float* weight, float* weight_cmf, 
-    float* output, unsigned int* sample_cnt
+    float* input, float* input_cmf,  float* pinput_pmf,
+    float* weight, float* weight_cmf, float* pweight_pmf,
+    float* output, unsigned int* sample_cnt, unsigned int* debug
 ) {
     unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
     // some random number to get the seed
-    unsigned int lcg_state = index * 352673253;
+    unsigned int lcg_state = index * 372673253;
+
+    uint4 state = {index * 3262432, index * 5747547 - 100, index * 325325 + 124, index * 3252626};
 
     for(int i = 0; i < num_accumulations; i++) {
         lcg_state = (LCG_MULT * lcg_state + LCG_ITER) % LCG_MAX;
 
-        int input_idx = binary_search(input_cmf, num_rows * feat_dim_in, (float)lcg_state / LCG_MAX);
+        float selected_input_pmf = hybrid_taus(state);
+        int input_idx = binary_search(input_cmf, num_rows * feat_dim_in, selected_input_pmf);
         int input_row = input_idx / feat_dim_in;
         int input_col = input_idx % feat_dim_in;
         float input_pmf = input_cmf[input_idx] - (input_idx != 0 ? input_cmf[input_idx - 1] : 0.0);
 
         // now that we have an input col, we need to search that row in the weight in particular
 
+        //atomicAdd(&debug[input_idx], 1);
+
         lcg_state = (LCG_MULT * lcg_state + LCG_ITER) % LCG_MAX;
+
+        float selected_weight_pmf = hybrid_taus(state);
         int weight_row = input_col; // column becomes row because of how matrix multiplication flips it
-        int weight_idx = binary_search(&weight_cmf[weight_row * feat_dim_out], feat_dim_out, (float)lcg_state / LCG_MAX);
+        int weight_idx = binary_search(&weight_cmf[weight_row * feat_dim_out], feat_dim_out, selected_weight_pmf);
         int weight_col = weight_idx; // no need to modulate
-        float weight_pmf = weight_cmf[weight_row * feat_dim_out + weight_col] - (weight_col != 0 ? weight_cmf[weight_row * feat_dim_out + weight_col - 1] : 0.0);
+        float weight_pmf =  weight_cmf[weight_row * feat_dim_out + weight_col] - (weight_col != 0 ? weight_cmf[weight_row * feat_dim_out + weight_col - 1] : 0.0);
 
 
         float input_val = input[input_idx]; // we can reuse this variable from before
         float weight_val = weight[weight_col * feat_dim_in + weight_row]; // need to flip because of how weight is represented
 
+        #if 0
+        if(input_row == 2 && weight_col == 2) {
+            atomicAdd(&debug[input_col], 1);
+            debug[input_col + 4] = input_val * weight_val;
+            debug[input_col + 8] = input_val;
+            debug[input_col + 12] = weight_val;
+        }
+        #endif
 
         // this actually should simplyfy down a lot
         atomicAdd(&output[input_row * feat_dim_out + weight_col], input_val * weight_val / (input_pmf * weight_pmf));
@@ -149,9 +192,11 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    #if 0
     float arr[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     input = torch::from_blob(arr, {1, 3, 4}, torch::dtype(torch::kFloat32)).contiguous().to(torch::kCUDA);
     weight = torch::from_blob(arr, {3, 4}, torch::dtype(torch::kFloat32)).contiguous().to(torch::kCUDA);
+    #endif
 
     unsigned int batch_size, seq_len, feat_dim_in, feat_dim_out, w_feat_dim_in;
 
@@ -174,6 +219,8 @@ int main(int argc, char** argv) {
     std::cout << "\t(W) Feat dim out: " << feat_dim_out << "\n";
     std::cout << "\t(W) Feat dim in: " << w_feat_dim_in << "\n";
 
+    return;
+
     std::cout << "Calculating reference matrix...\n";
     torch::Tensor reference = torch::matmul(input, weight.transpose(0, 1));
 
@@ -187,17 +234,35 @@ int main(int argc, char** argv) {
     std::cout << "Creating input pmf...\n";
     // no idea if cumsum breaks contiguity so lets do it just to be safe
     torch::Tensor input_cmf = input.view(batch_size * seq_len * feat_dim_in).abs().cumsum(0).contiguous();
-    input_cmf /= input_cmf[batch_size * seq_len * feat_dim_in - 1].item<float>();
+    float matrix_norm = input_cmf[batch_size * seq_len * feat_dim_in - 1].item<float>();
+    input_cmf /= matrix_norm;
 
+    torch::Tensor input_pmf = input.view(batch_size * seq_len * feat_dim_in).abs() / matrix_norm;
+    input_pmf = input_pmf.contiguous();
 
     std::cout << "Creating weight pmf...\n";
     // if we pick a specific value in the input, then that value can only be multiplied by values within a particular row
     // so the weight matrix needs to be summed up on the row dimension
     torch::Tensor weight_cmf = weight.abs().cumsum(0);
-
+    std::cout << weight_cmf << std::endl;
     // we need to divide each row by the sum (which is in the last row)
-    weight_cmf /= weight_cmf.narrow(0, feat_dim_out - 1, 1).expand({feat_dim_out, feat_dim_in});
+    torch::Tensor row_norm = weight_cmf.narrow(0, feat_dim_out - 1, 1).expand({feat_dim_out, feat_dim_in});
+    std::cout << row_norm << std::endl;
+
+    weight_cmf = weight_cmf / row_norm;
+    std::cout << weight_cmf << std::endl;
+    std::cout << row_norm << std::endl;
+
     weight_cmf = weight_cmf.transpose(0, 1).contiguous(); // make this easier for our code to read
+
+    torch::Tensor weight_pmf = weight.abs();
+    std::cout << weight_pmf << std::endl;
+    std::cout << row_norm << std::endl;
+
+    weight_pmf = weight_pmf / row_norm;
+    std::cout << weight_pmf << std::endl;
+
+    weight_pmf = weight_pmf.transpose(0, 1).contiguous(); 
 
     std::cout << "Creating output and sample count matrices...\n";
     torch::Tensor output = torch::zeros({batch_size * seq_len, feat_dim_out}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0)).contiguous();
@@ -212,7 +277,7 @@ int main(int argc, char** argv) {
     const int num_accumulations = 32;
 
     std::cout << "Running importance sampling pass...\n";
-    const int num_threads_is = 128;
+    const int num_threads_is = 16384;
     const int block_size_is = 128;
     #if 1
     is_gemm<<<num_threads_is / block_size_is, block_size_is>>>(
@@ -222,10 +287,14 @@ int main(int argc, char** argv) {
         num_accumulations,
         (float*)input.data_ptr(), 
         (float*)input_cmf.data_ptr(), 
+        (float*)input_pmf.data_ptr(), 
         (float*)weight.data_ptr(), 
         (float*)weight_cmf.data_ptr(), 
+        (float*)weight_pmf.data_ptr(), 
         (float*)output.data_ptr(),
-        (unsigned int*) sample_cnt.data_ptr()
+        (unsigned int*) sample_cnt.data_ptr(),
+        (unsigned int*) stuff.data_ptr()
+
     );
     #else
     mc_gemm<<<num_threads_is / block_size_is, block_size_is>>>(
@@ -243,7 +312,7 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
 
     std::cout << "Running division pass...\n";
-    output /= (float)(num_threads_is * num_accumulations);
+    output = output / (float)(num_threads_is * num_accumulations);
     #else
     dim3 block_size = {32, 32, 1};
     dim3 grid_size = {(batch_size * seq_len - 1) / 32 + 1, (feat_dim_out - 1) / 32 + 1, 1};
@@ -265,12 +334,17 @@ int main(int argc, char** argv) {
     std::cout << weight << std::endl;
     std::cout << output << std::endl;
     std::cout << sample_cnt << std::endl;
+    std::cout << sample_cnt.to(torch::kFloat32) / (float)(num_threads_is * num_accumulations) << std::endl;
     std::cout << reference << std::endl;
     std::cout << stuff << std::endl;
 
     std::cout << "CMFs" << std::endl;
     std::cout << input_cmf << std::endl;
+    std::cout << input_pmf << std::endl;
+    std::cout << matrix_norm << std::endl;
     std::cout << weight_cmf << std::endl;
+    std::cout << weight_pmf << std::endl;
+    std::cout << row_norm << std::endl;
 
     return 0;
 }
