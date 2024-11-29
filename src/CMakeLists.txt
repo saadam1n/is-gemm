@@ -4,7 +4,10 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 add_executable(is_gemm 
-    is_gemm.cu
+    common.hpp
+    gemm_test.cu
+    is_gemm.hpp
+    mc_gemm.hpp
 )
 
 target_link_libraries(is_gemm
