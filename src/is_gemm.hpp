@@ -14,9 +14,15 @@ __global__ void is_gemm_kernel(
 ) {
     unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
 
-    // set up the a PRNG state
+    // set up the a PRNG state using prime numbers
+    // primes copied from https://www.math.utah.edu/~pa/MDS/primes.html
     unsigned int thread_seed = index + seed;
-    uint4 state = {thread_seed * 3262432, thread_seed * 5747547, thread_seed * 325325, thread_seed * 3252626};
+    uint4 state = {
+        thread_seed * 2147483647 + 2147483629, 
+        thread_seed * 2147483563 + 2147483549, 
+        thread_seed * 2147483489 + 2147483477, 
+        thread_seed * 2147483353 + 2147483323
+    };
 
     for(int i = 0; i < num_accumulations; i++) {
         float selected_input_pmf = hybrid_taus(state);
@@ -68,18 +74,17 @@ torch::Tensor run_is_gemm(torch::Tensor input, torch::Tensor weight) {
     weight_cmf = weight_cmf.transpose(0, 1).contiguous(); // make this easier for our code to read
 
 
-
     // now that are tensors are set up, let's do the actual accumulation
     const int num_accumulations = 1;
-
     const int num_threads = 128;
     const int block_size = 128;
 
+    std::cout << "Running importance sampling pass...\n";
+
+    torch::Tensor output = torch::zeros({batch_size * seq_len, feat_dim_out}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0)).contiguous();
+
     // sync just in case pytorch does stuff differently
     cudaDeviceSynchronize();
-
-    std::cout << "Running importance sampling pass...\n";
-    torch::Tensor output = torch::zeros({batch_size * seq_len, feat_dim_out}, torch::dtype(torch::kFloat32).device(torch::kCUDA, 0)).contiguous();
     is_gemm_kernel<<<num_threads / block_size, block_size>>>(
         batch_size * seq_len,
         feat_dim_in,
@@ -92,6 +97,7 @@ torch::Tensor run_is_gemm(torch::Tensor input, torch::Tensor weight) {
         (float*)weight_cmf.data_ptr(), 
         (float*)output.data_ptr()
     );
+    cudaDeviceSynchronize();
 
     output = output / (float)(num_threads * num_accumulations);
 

@@ -5,8 +5,9 @@
 #include "common.hpp"
 #include "is_gemm.hpp"
 #include "mc_gemm.hpp"
+#include "ais_gemm.hpp"
 
-//#define USE_EXTERNAL_MATRICES
+#define USE_EXTERNAL_MATRICES
 
 int main(int argc, char** argv) {
     // ============= Start of setup code =============
@@ -78,7 +79,7 @@ int main(int argc, char** argv) {
 
     
     // use a GEMM algorithm to calculate the output matrix
-    torch::Tensor output = run_is_gemm(input, weight);
+    torch::Tensor output = run_ais_gemm(input, weight);
 
 
     std::cout << "Calculating reference matrix...\n";

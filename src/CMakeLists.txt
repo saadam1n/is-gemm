@@ -8,6 +8,7 @@ add_executable(is_gemm
     gemm_test.cu
     is_gemm.hpp
     mc_gemm.hpp
+    ais_gemm.hpp
 )
 
 target_link_libraries(is_gemm
@@ -17,3 +18,12 @@ target_link_libraries(is_gemm
 
 target_include_directories(is_gemm PRIVATE ${TORCH_INCLUDE_DIRS})
 set_property(TARGET is_gemm PROPERTY CXX_STANDARD 17)
+
+target_compile_options(
+    is_gemm 
+    PRIVATE 
+    $<$<COMPILE_LANGUAGE:CUDA>: 
+        --generate-line-info
+        --source-in-ptx
+    >
+)
