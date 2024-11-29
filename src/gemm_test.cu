@@ -102,8 +102,13 @@ int main(int argc, char** argv) {
     std::cout << "\n\n";
 
     std::cout << "==== RESULTS ====\n";
-    std::cout << "Average L1 error was " << l1_error.sum().item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
-    std::cout << "Max possible L1 error should be " <<  torch::abs(reference).sum().item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average L1 norm of (reference - output) is " << l1_error.sum().item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average L1 norm of reference is " <<  torch::abs(reference).sum().item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average L1 norm of output is " <<  torch::abs(output).sum().item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average Forbenius norm of the (reference - output) is " << torch::linalg_matrix_norm(reference - output).item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average Forbenius norm of the reference is " << torch::linalg_matrix_norm(reference).item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+    std::cout << "Average Forbenius norm of the output is " << torch::linalg_matrix_norm(output).item<float>() / (batch_size * seq_len * feat_dim_out) << "\n";
+
     std::cout << "\n\n";
 
     // ============= End of testing code =============
