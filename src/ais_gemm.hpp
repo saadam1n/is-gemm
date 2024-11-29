@@ -35,7 +35,6 @@ __global__ void ais_gemm_kernel(
         // generate a random number in [0, 1) and binary search its associated location
         float selected_location_cmf = hybrid_taus(state);
         int location = binary_search(location_cmf, num_rows * feat_dim_out, selected_location_cmf);
-        float selected_location_pmf = location_cmf[location] - (location != 0 ? location_cmf[location - 1] : 0.0);
 
         int row_idx = location / feat_dim_out;
         int col_idx = location % feat_dim_out;
@@ -65,9 +64,23 @@ __global__ void ais_gemm_kernel(
     }
 }
 
+#define SVD_PRIOR_ESTIMATION
+
 torch::Tensor run_ais_gemm(torch::Tensor input, torch::Tensor weight) {
     // for debugging pruposes I will use the exact reference matrix as the prior estimate
-    torch::Tensor prior_estimate = torch::matmul(input, weight.transpose(0, 1)).view(batch_size * seq_len * feat_dim_out).contiguous().abs();
+    #ifdef SVD_PRIOR_ESTIMATION
+    auto svd = torch::linalg_svd(weight.transpose(0, 1), false);
+    torch::Tensor u  = std::get<0>(svd);
+    torch::Tensor s  = torch::diagflat(std::get<1>(svd));
+    torch::Tensor vh = std::get<2>(svd);
+
+    torch::Tensor lhs = torch::matmul(input, u);
+    torch::Tensor rhs = torch::matmul(s, vh);
+    torch::Tensor prior_estimate = torch::matmul(lhs, rhs);
+    #else
+    torch::Tensor prior_estimate = torch::matmul(input, weight.transpose(0, 1));
+    #endif
+    prior_estimate = prior_estimate.view(batch_size * seq_len * feat_dim_out).contiguous().abs();
     torch::Tensor location_cmf = prior_estimate.cumsum(0);
     float location_norm_factor = location_cmf[batch_size * seq_len * feat_dim_out - 1].item<float>();
     location_cmf = location_cmf / location_norm_factor;
@@ -84,9 +97,10 @@ torch::Tensor run_ais_gemm(torch::Tensor input, torch::Tensor weight) {
 
 
     // now that are tensors are set up, let's do the actual accumulation
-    const int num_accumulations = 1024 * 16;
-    const int num_threads = 16384 * 16;
-    const int block_size = 128 * 6;
+    const int num_accumulations = 1024;
+    // these parameters fill up a RTX A5000 GPU
+    const int block_size = 768; // 2 blocks per SM
+    const int num_threads = block_size * 128; // 64 SMs per GPU, 2 * 64 = 128
 
     std::cout << "Running assisted importance sampling pass...\n";
 
@@ -108,7 +122,7 @@ torch::Tensor run_ais_gemm(torch::Tensor input, torch::Tensor weight) {
     );
     cudaDeviceSynchronize();
 
-    float norm_factor = (2.0 / double(num_threads)) / double(num_accumulations);
+    float norm_factor = (2.0 / double(num_threads)) / double(num_accumulations) / 8;
     output = norm_factor * output / location_pmf.view({batch_size * seq_len, feat_dim_out});
 
     // placeholder return value
